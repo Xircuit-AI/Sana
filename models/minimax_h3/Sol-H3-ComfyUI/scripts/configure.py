@@ -1,16 +1,23 @@
 """Reuse a prepared 5090 environment and write host-local ComfyUI profiles."""
 import argparse
 import json
+import os
 from pathlib import Path
 
 REQUIRED = ("stage1_python", "qwen_python", "h3_model", "fastvideo_root",
             "fa4_root", "ltx_root", "qwen_checkpoint", "comfy_root")
 
 
-def validate_model(root):
-    """Check actual files: glob() alone also returns broken symlinks."""
+def validate_model(root, *, skip_transformer=False):
+    """Check actual files: glob() alone also returns broken symlinks.
+
+    One-stage inference uses the merged FP8 DiT. The BF16 transformer shards are
+    deleted after convert_fp8.py --consume, so they are not required when
+    H3_SKIP_TRANSFORMER=1 or when --hyperflow-fp8-dir is set and the shards are gone.
+    """
     root = Path(root)
-    for component in ("transformer", "vae", "audio_vae"):
+    components = ("vae", "audio_vae") if skip_transformer else ("transformer", "vae", "audio_vae")
+    for component in components:
         folder = root / component
         index = folder / "diffusion_pytorch_model.safetensors.index.json"
         files = (set(json.loads(index.read_text())["weight_map"].values())
@@ -67,7 +74,18 @@ def main():
             raise FileNotFoundError(value)
         paths[key] = str(value.absolute())
     paths["dense_lora"] = str(args.dense_lora.resolve(strict=True))
-    validate_model(paths["h3_model"])
+    transformer_index = Path(paths["h3_model"]) / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
+    # --consume deletes the BF16 shards and leaves the index. Skip that check when
+    # the FP8 directory is the DiT this profile will run.
+    shards_ready = False
+    if transformer_index.is_file():
+        names = set(json.loads(transformer_index.read_text())["weight_map"].values())
+        shards_ready = bool(names) and all(
+            (transformer_index.parent / name).is_file() for name in names)
+    skip_transformer = os.environ.get("H3_SKIP_TRANSFORMER") == "1" or (
+        args.hyperflow_fp8_dir is not None and not shards_ready
+    )
+    validate_model(paths["h3_model"], skip_transformer=skip_transformer)
     destination = args.output_dir.resolve()
     destination.mkdir(parents=True, exist_ok=True)
     paths_file = destination / "paths.json"
